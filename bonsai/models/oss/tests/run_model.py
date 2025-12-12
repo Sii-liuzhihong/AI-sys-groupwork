@@ -17,42 +17,37 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax import P
-from jax.sharding import AxisType
+from transformers import AutoTokenizer
+
 
 from bonsai.models.oss import modeling
 from bonsai.models.oss.params import create_model_from_checkpoint
 
 
-def run_model(checkpoint_path: str, use_sharding: bool = False):
+def run_model(checkpoint_path: str):
     """
     Run OSS model inference.
     
     Args:
         checkpoint_path: Path to the model checkpoint directory
-        use_sharding: Whether to use sharding for distributed inference
     """
     # Create model configuration
-    config = modeling.ModelConfig.default(use_sharding=use_sharding)
+    config = modeling.ModelConfig.default()
     
-    # Setup sharding if needed
-    mesh = None
-    if use_sharding:
-        # Example: 2x2 mesh for FSDP and TP
-        mesh = jax.make_mesh(
-            (2, 2), ("fsdp", "tp"), axis_types=(AxisType.Explicit, AxisType.Explicit)
-        )
-        jax.set_mesh(mesh)
+    
     
     # Load model from checkpoint
     print(f"Loading model from {checkpoint_path}...")
-    model = create_model_from_checkpoint(checkpoint_path, config, mesh)
+    model = create_model_from_checkpoint(checkpoint_path, config)
     print("Model loaded successfully!")
     
-    # Example input tokens (you should replace this with actual tokenization)
-    # This is a simple example with dummy tokens
-    batch_size = 1
-    seq_len = 10
-    tokens = jnp.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]], dtype=jnp.int32)
+    # Tokenize a single paragraph query instead of dummy numeric tokens
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    paragraph = (
+        "In a serene afternoon, the sky stretches wide and clear above the city, "
+    )
+    encoded = tokenizer([paragraph], return_tensors="np", padding=True)
+    tokens = jnp.array(encoded["input_ids"], dtype=jnp.int32)
     
     print(f"Running forward pass with input shape: {tokens.shape}")
     
@@ -71,7 +66,7 @@ def run_model(checkpoint_path: str, use_sharding: bool = False):
     next_token = jnp.argmax(last_logits)
     print(f"Next predicted token: {next_token}")
     
-    return model, logits
+    return model, logits, tokens
 
 
 def generate_tokens(
@@ -133,28 +128,27 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 2:
-        print("Usage: python -m bonsai.models.oss.tests.run_model <checkpoint_path> [--sharding]")
+
         print("\nExample:")
         print("  python -m bonsai.models.oss.tests.run_model /path/to/checkpoint")
-        print("  python -m bonsai.models.oss.tests.run_model /path/to/checkpoint --sharding")
         sys.exit(1)
     
     checkpoint_path = sys.argv[1]
-    use_sharding = "--sharding" in sys.argv
+
     
     # Run the model
-    model, logits = run_model(checkpoint_path, use_sharding=use_sharding)
+    model, logits, tokens = run_model(checkpoint_path)
     
     # Example generation
     print("\n" + "=" * 50)
     print("Example token generation:")
     print("=" * 50)
     
-    prompt = [1, 2, 3, 4, 5]  # Replace with actual tokenized prompt
-    print(f"Prompt tokens: {prompt}")
+    # Use the same paragraph for generation starting point
+    prompt_tokens = list(np.array(tokens[0]).tolist())
+    print(f"Prompt tokens (first 32): {prompt_tokens[:32]}")
     print("Generated tokens:", end=" ")
-    
-    for token in generate_tokens(model, prompt, max_tokens=10, temperature=1.0):
+    for token in generate_tokens(model, prompt_tokens, max_tokens=10, temperature=1.0):
         print(token, end=" ")
     print()
 
