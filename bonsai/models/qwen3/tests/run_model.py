@@ -23,6 +23,7 @@ from huggingface_hub import snapshot_download
 from jax import P
 from jax.sharding import AxisType
 from transformers import AutoTokenizer
+import os
 
 from bonsai.models.qwen3 import modeling, params
 from bonsai.utils import GreedySampler, Sampler
@@ -44,6 +45,7 @@ def tokenize(tokenizer, input: list[str], shd: P | None = None):
 def run_model():
     # For sharding, you can use one of the following:
     model_ckpt_path = snapshot_download("Qwen/Qwen3-0.6B")
+    model_ckpt_path = "/inspire/hdd/project/robot-decision/liuzhihong-253108100071/project/homework/ai_system/group_work/models/Qwen/Qwen3-0.6B"
     config = modeling.ModelConfig.qwen3_0_6b(use_sharding=False)
     mesh, batch_shd = None, None
 
@@ -96,9 +98,18 @@ def run_model():
         decoded = tokenizer.decode(seq_tokens, skip_special_tokens=True)
         print(f"Answer:\n {decoded}\n\n")
 
+def down_load():
+    local_dir = "/inspire/hdd/project/robot-decision/liuzhihong-253108100071/project/homework/ai_system/group_work/modelsQwen/Qwen3-0.6B"
+    os.makedirs(local_dir, exist_ok=True)
+    
+    model_ckpt_path = snapshot_download(
+        "Qwen/Qwen3-0.6B",
+        local_dir=local_dir
+    )
 
 if __name__ == "__main__":
     run_model()
+    # down_load()
 
 
 __all__ = ["run_model"]
