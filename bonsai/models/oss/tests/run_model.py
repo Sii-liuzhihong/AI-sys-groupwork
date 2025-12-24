@@ -51,20 +51,21 @@ def run_model(checkpoint_path: str):
     
     print(f"Running forward pass with input shape: {tokens.shape}")
     
-    # Forward pass
-    logits = model(tokens)
+    logits = None
+    # # Forward pass
+    # logits = model(tokens)
     
-    print(f"Output logits shape: {logits.shape}")
-    print(f"Vocabulary size: {logits.shape[-1]}")
+    # print(f"Output logits shape: {logits.shape}")
+    # print(f"Vocabulary size: {logits.shape[-1]}")
     
-    # Get predictions (greedy decoding)
-    predicted_tokens = jnp.argmax(logits, axis=-1)
-    print(f"Predicted tokens: {predicted_tokens}")
+    # # Get predictions (greedy decoding)
+    # predicted_tokens = jnp.argmax(logits, axis=-1)
+    # print(f"Predicted tokens: {predicted_tokens}")
     
-    # Example: generate next token
-    last_logits = logits[0, -1, :]  # Get logits for last position
-    next_token = jnp.argmax(last_logits)
-    print(f"Next predicted token: {next_token}")
+    # # Example: generate next token
+    # last_logits = logits[0, -1, :]  # Get logits for last position
+    # next_token = jnp.argmax(last_logits)
+    # print(f"Next predicted token: {next_token}")
     
     return model, logits, tokens
 
@@ -112,7 +113,7 @@ def generate_tokens(
             # Apply temperature
             scaled_logits = last_logits / temperature
             probs = jax.nn.softmax(scaled_logits)
-            next_token = int(jax.random.categorical(jax.random.key(0), probs))
+            next_token = int(jax.random.categorical(jax.random.PRNGKey(0),probs))
         
         tokens.append(next_token)
         num_generated += 1

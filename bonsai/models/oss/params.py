@@ -129,9 +129,13 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
         
         # Attention - QKV are separate in checkpoint, need to concatenate
         r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (r"block.\1.attn.qkv.kernel", Transform.QKV),
+        r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (r"block.\1.attn.qkv.bias", Transform.BIAS),
         r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (r"block.\1.attn.qkv.kernel", Transform.QKV),
+        r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (r"block.\1.attn.qkv.bias", Transform.BIAS),
         r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (r"block.\1.attn.qkv.kernel", Transform.QKV),
+        r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (r"block.\1.attn.qkv.bias", Transform.BIAS),
         r"model\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (r"block.\1.attn.out.kernel", Transform.O),
+        r"model\.layers\.([0-9]+)\.self_attn\.o_proj\.bias": (r"block.\1.attn.out.bias", Transform.BIAS),
         r"model\.layers\.([0-9]+)\.self_attn\.sinks": (r"block.\1.attn.sinks", Transform.SINKS),
         
         # Norms - to_pure_dict() flattens Param.value, so scale is directly ShapeDtypeStruct
@@ -141,6 +145,7 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
         
         # MLP - router is the gate, experts contain the weights
         r"model\.layers\.([0-9]+)\.mlp\.router\.weight": (r"block.\1.mlp.gate.kernel", Transform.GATE),
+        r"model\.layers\.([0-9]+)\.mlp\.router\.bias": (r"block.\1.mlp.gate.bias", Transform.BIAS),
         r"model\.layers\.([0-9]+)\.mlp\.experts\.gate_up_proj_blocks": (
             (r"block.\1.mlp.mlp1_weight.blocks", r"block.\1.mlp.mlp1_weight.scales"),
             Transform.MLP1_WEIGHT,
@@ -331,6 +336,7 @@ def create_model_from_checkpoint(
     
     # Track Q, K, V weights separately to merge them into QKV
     qkv_weights = {}  # layer_idx -> {'q': tensor, 'k': tensor, 'v': tensor}
+    qkv_bias = {}  # layer_idx -> {'q': tensor, 'k': tensor, 'v': tensor}
 
     for f in files:
         with safetensors.safe_open(f, framework="numpy") as sf:
@@ -373,6 +379,16 @@ def create_model_from_checkpoint(
                     qkv_weights[layer_idx][proj_type] = tensor
                     continue  # Skip individual assignment, will merge later
 
+                # Handle Q, K, V separately - collect them first, merge later
+                qkv_match = re.match(r"model\.layers\.([0-9]+)\.self_attn\.(q|k|v)_proj\.bias", torch_key)
+                if qkv_match:
+                    layer_idx = int(qkv_match.group(1))
+                    proj_type = qkv_match.group(2)
+                    if layer_idx not in qkv_bias:
+                        qkv_bias[layer_idx] = {}
+                    qkv_bias[layer_idx][proj_type] = tensor
+                    continue  # Skip individual assignment, will merge later
+
                 jax_key, transform = _torch_key_to_jax_key(key_mapping, torch_key)
                 if jax_key is None:
                     # Skip keys that don't match any pattern (might be metadata or unused)
@@ -390,6 +406,25 @@ def create_model_from_checkpoint(
                     )
         gc.collect()
 
+    for layer_idx, qkv_dict in qkv_bias.items():
+        if 'q' in qkv_dict and 'k' in qkv_dict and 'v' in qkv_dict:
+            q = qkv_dict['q']
+            k = qkv_dict['k']
+            v = qkv_dict['v']
+            qkv = jnp.concatenate([q, k, v], axis=0)
+            jax_key = f"block.{layer_idx}.attn.qkv.bias"
+            keys = [_stoi(k) for k in jax_key.split(".")]
+            try:
+                # QKV is now [hidden_size, qkv_dim] - correct format for nnx.Linear
+                # No transform needed
+                transform_val = None
+                _assign_weights(keys, qkv, state_dict, f"qkv_layer_{layer_idx}", transform_val)
+            except Exception as e:
+                conversion_errors.append(
+                    f"Failed to assign merged QKV for layer {layer_idx}: {type(e).__name__}: {e}"
+                )
+
+    
     # Merge Q, K, V into QKV and assign
     for layer_idx, qkv_dict in qkv_weights.items():
         if 'q' in qkv_dict and 'k' in qkv_dict and 'v' in qkv_dict:

@@ -236,13 +236,13 @@ class AttentionBlock(nnx.Module):
 
         # QKV projection
         qkv_dim = config.head_dim * (config.num_attention_heads + 2 * config.num_key_value_heads)
-        self.qkv = nnx.Linear(config.hidden_size, qkv_dim, use_bias=False, dtype=jnp.bfloat16, rngs=rngs)
+        self.qkv = nnx.Linear(config.hidden_size, qkv_dim, use_bias=True, dtype=jnp.bfloat16, rngs=rngs)
 
         # Output projection
         self.out = nnx.Linear(
                 config.head_dim * config.num_attention_heads,
                 config.hidden_size,
-                use_bias=False,
+                use_bias=True,
                 dtype=jnp.bfloat16,
                 rngs=rngs,
             )
@@ -308,7 +308,7 @@ class MLPBlock(nnx.Module):
         self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
 
         # Gate projection
-        self.gate = nnx.Linear(config.hidden_size, config.num_experts, use_bias=False, dtype=jnp.bfloat16, rngs=rngs)
+        self.gate = nnx.Linear(config.hidden_size, config.num_experts, use_bias=True, dtype=jnp.bfloat16, rngs=rngs)
 
 
         # MLP weights (per expert)
