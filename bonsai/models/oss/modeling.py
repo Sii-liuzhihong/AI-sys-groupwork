@@ -186,7 +186,7 @@ def sdpa(
 ) -> jnp.ndarray:
     """Scaled dot-product attention with sliding window and sink tokens."""
     # sliding_window == 0 means no sliding window
-    n_tokens, n_heads, q_mult, d_head = Q.shape
+    n_tokens, n_heads, q_mult, d_head = Q.shape    
     assert K.shape == (n_tokens, n_heads, d_head)
     assert V.shape == (n_tokens, n_heads, d_head)
 
@@ -351,96 +351,76 @@ class MLPBlock(nnx.Module):
         # torch softmax on dim=1 corresponds to axis=1 in jax (over experts_per_token dimension)
         expert_weights = jax.nn.softmax(expert_weights, axis=-1)
 
-        # MLP #1
-        # Gather expert weights
-        # If expert_indices is [batch, seq_len, experts_per_token], then:
-        # mlp1_weight[expert_indices, ...] -> [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size]
-        # Access Param value - use direct indexing which should work with nnx.Param
-        # If _value is ShapeDtypeStruct, nnx will handle it during computation
-        try:
-            mlp1_weight = self.mlp1_weight[expert_indices, ...]
-            mlp1_bias = self.mlp1_bias[expert_indices, ...]
-        except (TypeError, AttributeError) as e:
-            # Fallback: try to access _value directly
-            from flax.nnx import variablelib
-            from jax import ShapeDtypeStruct
-            if isinstance(self.mlp1_weight, variablelib.Param):
-                mlp1_weight_val = getattr(self.mlp1_weight, '_value', None)
-                if mlp1_weight_val is not None and not isinstance(mlp1_weight_val, ShapeDtypeStruct):
-                    mlp1_weight = mlp1_weight_val[expert_indices, ...]
-                else:
-                    # If still ShapeDtypeStruct, this means weights weren't loaded
-                    # Try to get from the model's state directly
-                    raise RuntimeError(f"mlp1_weight is ShapeDtypeStruct - weights not loaded. Error: {e}")
-            else:
-                raise
-        
-        # einsum: handle both 2D and 3D cases
-        # mlp1_weight: [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size] or [batch, experts_per_token, intermediate_size * 2, hidden_size]
+        # MLP #1 - Compute ALL experts (no gather operation)
+        # mlp1_weight: [num_experts=128, intermediate_size * 2, hidden_size]
         # t: [batch, seq_len, hidden_size] or [batch, hidden_size]
-        # Use 'k' for hidden_size dimension to avoid conflict with 'c' (intermediate_size * 2)
-        if len(mlp1_weight.shape) == 5:
-            # 3D case: [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size]
-            # bseck: batch, seq_len, experts_per_token, intermediate_size*2, hidden_size
-            # bsk: batch, seq_len, hidden_size
-            # bsec: batch, seq_len, experts_per_token, intermediate_size*2
-            t = jnp.einsum("bseck,bsk->bsec", mlp1_weight, t) + mlp1_bias
+        # Compute all experts: [batch, seq_len, num_experts, intermediate_size*2] or [batch, num_experts, intermediate_size*2]
+        
+        if t.ndim == 3:
+            # 3D case: [batch, seq_len, hidden_size]
+            # Output: [batch, seq_len, num_experts=128, intermediate_size*2]
+            t_all = jnp.einsum("eck,bsk->bsec", self.mlp1_weight.value, t) + self.mlp1_bias.value[None, None, :, :]
         else:
-            # 2D case: [batch, experts_per_token, intermediate_size * 2, hidden_size]
-            # beck: batch, experts_per_token, intermediate_size*2, hidden_size
-            # bk: batch, hidden_size
-            # bec: batch, experts_per_token, intermediate_size*2
-            t = jnp.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
-        t = swiglu(t, limit=self.swiglu_limit)
+            # 2D case: [batch, hidden_size]
+            # Output: [batch, num_experts=128, intermediate_size*2]
+            t_all = jnp.einsum("eck,bk->bec", self.mlp1_weight.value, t) + self.mlp1_bias.value[None, :, :]
+        
+        t = swiglu(t_all, limit=self.swiglu_limit)
 
-        # MLP #2
-        try:
-            mlp2_weight = self.mlp2_weight[expert_indices, ...]
-            mlp2_bias = self.mlp2_bias[expert_indices, ...]
-        except (TypeError, AttributeError) as e:
-            from flax.nnx import variablelib
-            from jax import ShapeDtypeStruct
-            if isinstance(self.mlp2_weight, variablelib.Param):
-                mlp2_weight_val = getattr(self.mlp2_weight, '_value', None)
-                if mlp2_weight_val is not None and not isinstance(mlp2_weight_val, ShapeDtypeStruct):
-                    mlp2_weight = mlp2_weight_val[expert_indices, ...]
-                else:
-                    raise RuntimeError(f"mlp2_weight is ShapeDtypeStruct - weights not loaded. Error: {e}")
-            else:
-                raise
+        # MLP #2 - Compute ALL experts
+        # mlp2_weight: [num_experts=128, hidden_size, intermediate_size]
+        # t after swiglu: [batch, seq_len, num_experts, intermediate_size] or [batch, num_experts, intermediate_size]
+        # Output: [batch, seq_len, num_experts, hidden_size] or [batch, num_experts, hidden_size]
         
-        # einsum: handle both 2D and 3D cases
-        # mlp2_weight: [batch, seq_len, experts_per_token, hidden_size, intermediate_size] or [batch, experts_per_token, hidden_size, intermediate_size]
-        # t after swiglu: [batch, seq_len, experts_per_token, intermediate_size] or [batch, experts_per_token, intermediate_size]
-        # From PyTorch: einsum("beck,bek->bec") where:
-        # - mlp2_weight: [batch, experts_per_token, hidden_size, intermediate_size] (b, e, c, k)
-        # - t: [batch, experts_per_token, intermediate_size] (b, e, k)
-        # - output: [batch, experts_per_token, hidden_size] (b, e, c)
-        if len(mlp2_weight.shape) == 5:
-            # 3D case: [batch, seq_len, experts_per_token, hidden_size, intermediate_size]
-            # t: [batch, seq_len, experts_per_token, intermediate_size]
-            # Use 'bseck,bsek->bsec' where s=seq_len, e=experts_per_token, c=hidden_size, k=intermediate_size
-            t = jnp.einsum("bseck,bsek->bsec", mlp2_weight, t) + mlp2_bias
+        if t.ndim == 4:
+            # 3D case: [batch, seq_len, num_experts, intermediate_size]
+            # Output: [batch, seq_len, num_experts, hidden_size]
+            t = jnp.einsum("eck,bsek->bsec", self.mlp2_weight.value, t) + self.mlp2_bias.value[None, None, :, :]
         else:
-            # 2D case: [batch, experts_per_token, hidden_size, intermediate_size]
-            # t: [batch, experts_per_token, intermediate_size]
-            t = jnp.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
+            # 2D case: [batch, num_experts, intermediate_size]
+            # Output: [batch, num_experts, hidden_size]
+            t = jnp.einsum("eck,bek->bec", self.mlp2_weight.value, t) + self.mlp2_bias.value[None, :, :]
         
-        # Combine expert outputs with weights
-        # expert_weights: [batch, seq_len, experts_per_token] or [batch, experts_per_token]
-        # t: [batch, seq_len, experts_per_token, hidden_size] or [batch, experts_per_token, hidden_size]
-        # From PyTorch: torch.einsum("bec,be->bc", t, expert_weights)
-        # where t is [batch, experts_per_token, hidden_size] and expert_weights is [batch, experts_per_token]
-        if len(expert_weights.shape) == 3:
-            # 3D case: [batch, seq_len, experts_per_token]
-            # t: [batch, seq_len, experts_per_token, hidden_size]
+        # Create full expert weights mask: set non-selected experts to 0
+        # expert_weights: [batch, seq_len, experts_per_token=4] or [batch, experts_per_token]
+        # expert_indices: [batch, seq_len, experts_per_token=4] or [batch, experts_per_token]
+        # Goal: [batch, seq_len, num_experts=128] or [batch, num_experts] with only selected experts having weights
+        
+        if expert_weights.ndim == 3:
+            # 3D case
+            batch_size, seq_len, _ = expert_weights.shape
+            full_expert_weights = jnp.zeros((batch_size, seq_len, self.num_experts), dtype=expert_weights.dtype)
+            # Scatter expert_weights to the selected indices
+            # Use one_hot to create mask and sum
+            for i in range(self.experts_per_token):
+                indices_i = expert_indices[:, :, i]  # [batch, seq_len]
+                weights_i = expert_weights[:, :, i]  # [batch, seq_len]
+                # Create one-hot for this expert and multiply by weight
+                mask = jax.nn.one_hot(indices_i, self.num_experts, dtype=expert_weights.dtype)  # [batch, seq_len, num_experts]
+                full_expert_weights = full_expert_weights + mask * weights_i[:, :, None]
+        else:
+            # 2D case
+            batch_size, _ = expert_weights.shape
+            full_expert_weights = jnp.zeros((batch_size, self.num_experts), dtype=expert_weights.dtype)
+            for i in range(self.experts_per_token):
+                indices_i = expert_indices[:, i]  # [batch]
+                weights_i = expert_weights[:, i]  # [batch]
+                mask = jax.nn.one_hot(indices_i, self.num_experts, dtype=expert_weights.dtype)  # [batch, num_experts]
+                full_expert_weights = full_expert_weights + mask * weights_i[:, None]
+        
+        # Combine expert outputs with full weights (non-selected experts have weight=0)
+        # t: [batch, seq_len, num_experts, hidden_size] or [batch, num_experts, hidden_size]
+        # full_expert_weights: [batch, seq_len, num_experts] or [batch, num_experts]
+        if full_expert_weights.ndim == 3:
+            # 3D case: [batch, seq_len, num_experts]
+            # t: [batch, seq_len, num_experts, hidden_size]
             # Output: [batch, seq_len, hidden_size]
-            t = jnp.einsum("bsec,bse->bsc", t, expert_weights)
+            t = jnp.einsum("bsec,bse->bsc", t, full_expert_weights)
         else:
-            # 2D case: [batch, experts_per_token]
-            # t: [batch, experts_per_token, hidden_size]
+            # 2D case: [batch, num_experts]
+            # t: [batch, num_experts, hidden_size]
             # Output: [batch, hidden_size]
-            t = jnp.einsum("bec,be->bc", t, expert_weights)
+            t = jnp.einsum("bec,be->bc", t, full_expert_weights)
 
         return x + t
 
