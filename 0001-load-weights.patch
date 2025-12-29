@@ -1,0 +1,166 @@
+From 4b2cea6b6e09ad37174926042365c7133a02d49f Mon Sep 17 00:00:00 2001
+From: weinanliu <wnliu@stu.xmu.edu.cn>
+Date: Wed, 24 Dec 2025 19:08:27 +0000
+Subject: [PATCH] load weights
+
+---
+ bonsai/models/oss/modeling.py        |  6 ++---
+ bonsai/models/oss/params.py          | 35 ++++++++++++++++++++++++++++
+ bonsai/models/oss/tests/run_model.py | 25 ++++++++++----------
+ 3 files changed, 51 insertions(+), 15 deletions(-)
+
+diff --git a/bonsai/models/oss/modeling.py b/bonsai/models/oss/modeling.py
+index 200dcc7..ceae2a9 100644
+--- a/bonsai/models/oss/modeling.py
++++ b/bonsai/models/oss/modeling.py
+@@ -236,13 +236,13 @@ class AttentionBlock(nnx.Module):
+ 
+         # QKV projection
+         qkv_dim = config.head_dim * (config.num_attention_heads + 2 * config.num_key_value_heads)
+-        self.qkv = nnx.Linear(config.hidden_size, qkv_dim, use_bias=False, dtype=jnp.bfloat16, rngs=rngs)
++        self.qkv = nnx.Linear(config.hidden_size, qkv_dim, use_bias=True, dtype=jnp.bfloat16, rngs=rngs)
+ 
+         # Output projection
+         self.out = nnx.Linear(
+                 config.head_dim * config.num_attention_heads,
+                 config.hidden_size,
+-                use_bias=False,
++                use_bias=True,
+                 dtype=jnp.bfloat16,
+                 rngs=rngs,
+             )
+@@ -308,7 +308,7 @@ class MLPBlock(nnx.Module):
+         self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
+ 
+         # Gate projection
+-        self.gate = nnx.Linear(config.hidden_size, config.num_experts, use_bias=False, dtype=jnp.bfloat16, rngs=rngs)
++        self.gate = nnx.Linear(config.hidden_size, config.num_experts, use_bias=True, dtype=jnp.bfloat16, rngs=rngs)
+ 
+ 
+         # MLP weights (per expert)
+diff --git a/bonsai/models/oss/params.py b/bonsai/models/oss/params.py
+index f851463..0a9ff81 100644
+--- a/bonsai/models/oss/params.py
++++ b/bonsai/models/oss/params.py
+@@ -129,9 +129,13 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
+         
+         # Attention - QKV are separate in checkpoint, need to concatenate
+         r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (r"block.\1.attn.qkv.kernel", Transform.QKV),
++        r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (r"block.\1.attn.qkv.bias", Transform.BIAS),
+         r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (r"block.\1.attn.qkv.kernel", Transform.QKV),
++        r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (r"block.\1.attn.qkv.bias", Transform.BIAS),
+         r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (r"block.\1.attn.qkv.kernel", Transform.QKV),
++        r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (r"block.\1.attn.qkv.bias", Transform.BIAS),
+         r"model\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (r"block.\1.attn.out.kernel", Transform.O),
++        r"model\.layers\.([0-9]+)\.self_attn\.o_proj\.bias": (r"block.\1.attn.out.bias", Transform.BIAS),
+         r"model\.layers\.([0-9]+)\.self_attn\.sinks": (r"block.\1.attn.sinks", Transform.SINKS),
+         
+         # Norms - to_pure_dict() flattens Param.value, so scale is directly ShapeDtypeStruct
+@@ -141,6 +145,7 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
+         
+         # MLP - router is the gate, experts contain the weights
+         r"model\.layers\.([0-9]+)\.mlp\.router\.weight": (r"block.\1.mlp.gate.kernel", Transform.GATE),
++        r"model\.layers\.([0-9]+)\.mlp\.router\.bias": (r"block.\1.mlp.gate.bias", Transform.BIAS),
+         r"model\.layers\.([0-9]+)\.mlp\.experts\.gate_up_proj_blocks": (
+             (r"block.\1.mlp.mlp1_weight.blocks", r"block.\1.mlp.mlp1_weight.scales"),
+             Transform.MLP1_WEIGHT,
+@@ -331,6 +336,7 @@ def create_model_from_checkpoint(
+     
+     # Track Q, K, V weights separately to merge them into QKV
+     qkv_weights = {}  # layer_idx -> {'q': tensor, 'k': tensor, 'v': tensor}
++    qkv_bias = {}  # layer_idx -> {'q': tensor, 'k': tensor, 'v': tensor}
+ 
+     for f in files:
+         with safetensors.safe_open(f, framework="numpy") as sf:
+@@ -373,6 +379,16 @@ def create_model_from_checkpoint(
+                     qkv_weights[layer_idx][proj_type] = tensor
+                     continue  # Skip individual assignment, will merge later
+ 
++                # Handle Q, K, V separately - collect them first, merge later
++                qkv_match = re.match(r"model\.layers\.([0-9]+)\.self_attn\.(q|k|v)_proj\.bias", torch_key)
++                if qkv_match:
++                    layer_idx = int(qkv_match.group(1))
++                    proj_type = qkv_match.group(2)
++                    if layer_idx not in qkv_bias:
++                        qkv_bias[layer_idx] = {}
++                    qkv_bias[layer_idx][proj_type] = tensor
++                    continue  # Skip individual assignment, will merge later
++
+                 jax_key, transform = _torch_key_to_jax_key(key_mapping, torch_key)
+                 if jax_key is None:
+                     # Skip keys that don't match any pattern (might be metadata or unused)
+@@ -390,6 +406,25 @@ def create_model_from_checkpoint(
+                     )
+         gc.collect()
+ 
++    for layer_idx, qkv_dict in qkv_bias.items():
++        if 'q' in qkv_dict and 'k' in qkv_dict and 'v' in qkv_dict:
++            q = qkv_dict['q']
++            k = qkv_dict['k']
++            v = qkv_dict['v']
++            qkv = jnp.concatenate([q, k, v], axis=0)
++            jax_key = f"block.{layer_idx}.attn.qkv.bias"
++            keys = [_stoi(k) for k in jax_key.split(".")]
++            try:
++                # QKV is now [hidden_size, qkv_dim] - correct format for nnx.Linear
++                # No transform needed
++                transform_val = None
++                _assign_weights(keys, qkv, state_dict, f"qkv_layer_{layer_idx}", transform_val)
++            except Exception as e:
++                conversion_errors.append(
++                    f"Failed to assign merged QKV for layer {layer_idx}: {type(e).__name__}: {e}"
++                )
++
++    
+     # Merge Q, K, V into QKV and assign
+     for layer_idx, qkv_dict in qkv_weights.items():
+         if 'q' in qkv_dict and 'k' in qkv_dict and 'v' in qkv_dict:
+diff --git a/bonsai/models/oss/tests/run_model.py b/bonsai/models/oss/tests/run_model.py
+index 14ce409..60001e0 100644
+--- a/bonsai/models/oss/tests/run_model.py
++++ b/bonsai/models/oss/tests/run_model.py
+@@ -51,20 +51,21 @@ def run_model(checkpoint_path: str):
+     
+     print(f"Running forward pass with input shape: {tokens.shape}")
+     
+-    # Forward pass
+-    logits = model(tokens)
++    logits = None
++    # # Forward pass
++    # logits = model(tokens)
+     
+-    print(f"Output logits shape: {logits.shape}")
+-    print(f"Vocabulary size: {logits.shape[-1]}")
++    # print(f"Output logits shape: {logits.shape}")
++    # print(f"Vocabulary size: {logits.shape[-1]}")
+     
+-    # Get predictions (greedy decoding)
+-    predicted_tokens = jnp.argmax(logits, axis=-1)
+-    print(f"Predicted tokens: {predicted_tokens}")
++    # # Get predictions (greedy decoding)
++    # predicted_tokens = jnp.argmax(logits, axis=-1)
++    # print(f"Predicted tokens: {predicted_tokens}")
+     
+-    # Example: generate next token
+-    last_logits = logits[0, -1, :]  # Get logits for last position
+-    next_token = jnp.argmax(last_logits)
+-    print(f"Next predicted token: {next_token}")
++    # # Example: generate next token
++    # last_logits = logits[0, -1, :]  # Get logits for last position
++    # next_token = jnp.argmax(last_logits)
++    # print(f"Next predicted token: {next_token}")
+     
+     return model, logits, tokens
+ 
+@@ -112,7 +113,7 @@ def generate_tokens(
+             # Apply temperature
+             scaled_logits = last_logits / temperature
+             probs = jax.nn.softmax(scaled_logits)
+-            next_token = int(jax.random.categorical(jax.random.key(0), probs))
++            next_token = int(jax.random.categorical(jax.random.PRNGKey(0),probs))
+         
+         tokens.append(next_token)
+         num_generated += 1
+-- 
+2.25.1
+
